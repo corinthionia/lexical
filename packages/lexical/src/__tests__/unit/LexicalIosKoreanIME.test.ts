@@ -25,6 +25,7 @@
 import {buildEditorFromExtensions} from '@lexical/extension';
 import {RichTextExtension} from '@lexical/rich-text';
 import {
+  $createNodeSelection,
   $createParagraphNode,
   $createRangeSelection,
   $createTextNode,
@@ -32,7 +33,10 @@ import {
   $getSelection,
   $isRangeSelection,
   $setSelection,
+  FORMAT_TEXT_COMMAND,
+  IS_BOLD,
   type LexicalEditor,
+  type TextFormatType,
 } from 'lexical';
 import {invariant} from 'lexical/src/__tests__/utils';
 import {assert, describe, expect, onTestFinished, test, vi} from 'vitest';
@@ -80,16 +84,63 @@ function getDOMTextNode(editor: LexicalEditor, textKey: string): Text {
 function createBeforeInputEvent(
   inputType: string,
   targetRange: StaticRange | null,
+  data: string | null = null,
 ): InputEvent {
   const event = new InputEvent('beforeinput', {
     bubbles: true,
     cancelable: true,
+    data,
     inputType,
   });
   Object.defineProperty(event, 'getTargetRanges', {
     value: () => (targetRange ? [targetRange] : []),
   });
   return event;
+}
+
+function textNodes(editor: LexicalEditor): [number, string][] {
+  return editor.read(() =>
+    $getRoot()
+      .getAllTextNodes()
+      .map(node => [node.getFormat(), node.getTextContent()]),
+  );
+}
+
+function lastDOMTextNode(editor: LexicalEditor): Text {
+  const root = editor.getRootElement();
+  assert(root !== null, 'root element is null');
+  const walker = root.ownerDocument.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT,
+  );
+  let last: Node | null = null;
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    last = node;
+  }
+  assert(last !== null, 'expected a DOM text node');
+  return last as Text;
+}
+
+function imeKeystroke(
+  container: HTMLElement,
+  editor: LexicalEditor,
+  key: string,
+  removeCount: number,
+  insertData: string,
+): void {
+  editor.read(() => {});
+  container.dispatchEvent(new KeyboardEvent('keydown', {bubbles: true, key}));
+  const domText = lastDOMTextNode(editor);
+  const end = domText.nodeValue!.length;
+  container.dispatchEvent(
+    createBeforeInputEvent(
+      'deleteContentBackward',
+      createStaticRange(domText, end - removeCount, domText, end),
+    ),
+  );
+  container.dispatchEvent(
+    createBeforeInputEvent('insertText', null, insertData),
+  );
 }
 
 function createStaticRange(
@@ -110,11 +161,15 @@ async function setSingleTextNode(
   editor: LexicalEditor,
   text: string,
   cursorOffset: number,
+  format: TextFormatType | null = null,
 ): Promise<string> {
   let textKey = '';
   await editor.update(() => {
     const paragraph = $createParagraphNode();
     const node = $createTextNode(text);
+    if (format !== null) {
+      node.toggleFormat(format);
+    }
     paragraph.append(node);
     $getRoot().clear().append(paragraph);
     textKey = node.getKey();
@@ -122,6 +177,8 @@ async function setSingleTextNode(
     const sel = $createRangeSelection();
     sel.anchor.set(textKey, cursorOffset, 'text');
     sel.focus.set(textKey, cursorOffset, 'text');
+    sel.setFormat(node.getFormat());
+    sel.setStyle(node.getStyle());
     $setSelection(sel);
   });
   return textKey;
@@ -246,5 +303,149 @@ describe('iOS 10-key Korean IME — deleteContentBackward with targetRange', () 
     editor.read(() => {
       expect($getRoot().getTextContent()).toBe('안세요');
     });
+  });
+});
+
+describe('iOS Korean IME — format toggle during syllable rewriting', () => {
+  test('bold applies only to text typed after the toggle', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, '가나', 2);
+
+    editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold');
+
+    imeKeystroke(container, editor, 'ㄷ', 1, '낟');
+    expect(textNodes(editor)).toEqual([[0, '가낟']]);
+
+    imeKeystroke(container, editor, 'ㅏ', 1, '나다');
+    expect(textNodes(editor)).toEqual([
+      [0, '가나'],
+      [IS_BOLD, '다'],
+    ]);
+  });
+
+  test('unbold preserves the old text as bold', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, '가나', 2, 'bold');
+
+    editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold');
+    imeKeystroke(container, editor, 'ㄷ', 1, '낟');
+    imeKeystroke(container, editor, 'ㅏ', 1, '나다');
+
+    expect(textNodes(editor)).toEqual([
+      [IS_BOLD, '가나'],
+      [0, '다'],
+    ]);
+  });
+
+  test('a syllable with a final consonant inserts the next jamo directly', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, '안녕', 2);
+
+    editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold');
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', {bubbles: true, key: 'ㅎ'}),
+    );
+    container.dispatchEvent(createBeforeInputEvent('insertText', null, 'ㅎ'));
+    expect(textNodes(editor)).toEqual([
+      [0, '안녕'],
+      [IS_BOLD, 'ㅎ'],
+    ]);
+
+    imeKeystroke(container, editor, 'ㅏ', 1, '하');
+    expect(textNodes(editor)).toEqual([
+      [0, '안녕'],
+      [IS_BOLD, '하'],
+    ]);
+  });
+
+  test('a new keydown discards an abandoned rewrite', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, '가나', 2);
+
+    editor.read(() => {});
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', {bubbles: true, key: 'ㄷ'}),
+    );
+    const domText = lastDOMTextNode(editor);
+    container.dispatchEvent(
+      createBeforeInputEvent(
+        'deleteContentBackward',
+        createStaticRange(domText, 1, domText, 2),
+      ),
+    );
+
+    editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold');
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', {bubbles: true, key: 'X'}),
+    );
+    container.dispatchEvent(createBeforeInputEvent('insertText', null, 'X'));
+
+    expect(textNodes(editor)).toEqual([
+      [0, '가'],
+      [IS_BOLD, 'X'],
+    ]);
+  });
+
+  test('a handled selection insertion discards an abandoned rewrite', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, '가나', 2);
+
+    editor.read(() => {});
+    const domText = lastDOMTextNode(editor);
+    container.dispatchEvent(
+      createBeforeInputEvent(
+        'deleteContentBackward',
+        createStaticRange(domText, 1, domText, 2),
+      ),
+    );
+    expect(editor._inputState.imeReplacedText).not.toBeNull();
+
+    editor._inputState.isInsertTextAfterHandledSelectionCommand = true;
+    container.dispatchEvent(createBeforeInputEvent('insertText', null, 'X'));
+
+    expect(editor._inputState.imeReplacedText).toBeNull();
+  });
+
+  test('does not split a growing Hangul grapheme across formats', async () => {
+    const {container, editor} = mountEditor();
+    await setSingleTextNode(editor, 'ᄉ', 1);
+
+    editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold');
+    imeKeystroke(container, editor, 'ㆍ', 1, 'ᄉᆞ');
+
+    expect(textNodes(editor)).toEqual([[0, 'ᄉᆞ']]);
+
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', {bubbles: true, key: 'X'}),
+    );
+    container.dispatchEvent(createBeforeInputEvent('insertText', null, 'X'));
+    expect(textNodes(editor)).toEqual([
+      [0, 'ᄉᆞ'],
+      [IS_BOLD, 'X'],
+    ]);
+  });
+
+  test('a non-range insertion discards an abandoned rewrite', async () => {
+    const {container, editor} = mountEditor();
+    const textKey = await setSingleTextNode(editor, '가나', 2);
+
+    editor.read(() => {});
+    const domText = lastDOMTextNode(editor);
+    container.dispatchEvent(
+      createBeforeInputEvent(
+        'deleteContentBackward',
+        createStaticRange(domText, 1, domText, 2),
+      ),
+    );
+    expect(editor._inputState.imeReplacedText).not.toBeNull();
+
+    await editor.update(() => {
+      const selection = $createNodeSelection();
+      selection.add(textKey);
+      $setSelection(selection);
+    });
+    container.dispatchEvent(createBeforeInputEvent('insertText', null, 'X'));
+
+    expect(editor._inputState.imeReplacedText).toBeNull();
   });
 });

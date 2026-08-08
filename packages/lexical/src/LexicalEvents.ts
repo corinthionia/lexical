@@ -6,7 +6,7 @@
  *
  */
 
-import type {InputState, LexicalEditor} from './LexicalEditor';
+import type {IMEReplacedText, InputState, LexicalEditor} from './LexicalEditor';
 import type {NodeKey} from './LexicalNode';
 import type {ElementNode} from './nodes/LexicalElementNode';
 import type {TextNode} from './nodes/LexicalTextNode';
@@ -612,6 +612,7 @@ function onClick(event: PointerEvent, editor: LexicalEditor): void {
 }
 
 function onPointerDown(event: PointerEvent, editor: LexicalEditor) {
+  editor._inputState.imeReplacedText = null;
   // TODO implement text drag & drop
   // Resolve to the composed target so a pointerdown inside a decorator's
   // open shadow root reports the real internal element rather than the
@@ -818,6 +819,7 @@ function onBeforeInput(event: InputEvent, editor: LexicalEditor): void {
   // We let the browser do its own thing for composition.
   if (
     inputType === 'deleteCompositionText' ||
+    inputType === 'insertCompositionText' ||
     // If we're pasting in FF, we shouldn't get this event
     // as the `paste` event should have triggered, unless the
     // user has dom.event.clipboardevents.enabled disabled in
@@ -825,8 +827,7 @@ function onBeforeInput(event: InputEvent, editor: LexicalEditor): void {
     // pasted content in the DOM mutation phase.
     (IS_FIREFOX && isFirefoxClipboardEvents(editor))
   ) {
-    return;
-  } else if (inputType === 'insertCompositionText') {
+    editor._inputState.imeReplacedText = null;
     return;
   }
 
@@ -838,12 +839,90 @@ function onBeforeInput(event: InputEvent, editor: LexicalEditor): void {
   updateEditorSync(
     editor,
     () => {
-      if (!isInputEventTargetingCapturedSelection(event, editor)) {
-        dispatchCommand(editor, BEFORE_INPUT_COMMAND, event);
+      if (isInputEventTargetingCapturedSelection(event, editor)) {
+        editor._inputState.imeReplacedText = null;
+        return;
+      }
+      dispatchCommand(editor, BEFORE_INPUT_COMMAND, event);
+      if (inputType !== 'deleteContentBackward') {
+        // A higher-priority handler may consume the command before the core
+        // handler gets a chance to consume this one-shot state.
+        editor._inputState.imeReplacedText = null;
       }
     },
     {event},
   );
+}
+
+function $rememberIMEReplacedText(
+  inputState: InputState,
+  selection: RangeSelection,
+): void {
+  const nodes = selection.getNodes();
+  const node = nodes[0];
+  inputState.imeReplacedText =
+    nodes.length === 1 && $isTextNode(node)
+      ? {
+          format: node.getFormat(),
+          style: node.getStyle(),
+          text: selection.getTextContent(),
+        }
+      : null;
+}
+
+function $insertIMERewrittenText(
+  editor: LexicalEditor,
+  selection: RangeSelection,
+  data: string,
+  replaced: IMEReplacedText | null,
+): boolean {
+  if (
+    replaced === null ||
+    !selection.isCollapsed() ||
+    (replaced.format === selection.format && replaced.style === selection.style)
+  ) {
+    return false;
+  }
+
+  const pendingFormat = selection.format;
+  const pendingStyle = selection.style;
+  const restoredLength = getIMERewriteSplitOffset(data, replaced.text.length);
+  const restored = data.slice(0, restoredLength);
+  const typed = data.slice(restored.length);
+
+  if (restored !== '') {
+    selection.setFormat(replaced.format);
+    selection.setStyle(replaced.style);
+    dispatchCommand(editor, CONTROLLED_TEXT_INSERTION_COMMAND, restored);
+  }
+  const nextSelection = $getSelection();
+  if ($isRangeSelection(nextSelection)) {
+    nextSelection.setFormat(pendingFormat);
+    nextSelection.setStyle(pendingStyle);
+    if (typed !== '') {
+      dispatchCommand(editor, CONTROLLED_TEXT_INSERTION_COMMAND, typed);
+    }
+  }
+  return true;
+}
+
+function getIMERewriteSplitOffset(data: string, offset: number): number {
+  if (offset <= 0 || offset >= data.length) {
+    return offset;
+  }
+  if (typeof Intl.Segmenter === 'function') {
+    for (const {index, segment} of new Intl.Segmenter().segment(data)) {
+      const end = index + segment.length;
+      if (end >= offset) {
+        return end;
+      }
+    }
+  }
+  // Never split a surrogate pair on runtimes without Intl.Segmenter.
+  return /[\uD800-\uDBFF]/.test(data[offset - 1]) &&
+    /[\uDC00-\uDFFF]/.test(data[offset])
+    ? offset + 1
+    : offset;
 }
 
 function $handleBeforeInput(event: InputEvent): boolean {
@@ -851,6 +930,8 @@ function $handleBeforeInput(event: InputEvent): boolean {
   const targetRange = getTargetRange(event);
   const editor = getActiveEditor();
   const inputState = editor._inputState;
+  const imeReplacedText = inputState.imeReplacedText;
+  inputState.imeReplacedText = null;
 
   const selection = $getSelection();
 
@@ -928,6 +1009,7 @@ function $handleBeforeInput(event: InputEvent): boolean {
           selection.applyDOMRange(targetRange);
           if (!selection.isCollapsed()) {
             event.preventDefault();
+            $rememberIMEReplacedText(inputState, selection);
             selection.removeText();
             return true;
           }
@@ -1038,7 +1120,9 @@ function $handleBeforeInput(event: InputEvent): boolean {
       )
     ) {
       event.preventDefault();
-      dispatchCommand(editor, CONTROLLED_TEXT_INSERTION_COMMAND, data);
+      if (!$insertIMERewrittenText(editor, selection, data, imeReplacedText)) {
+        dispatchCommand(editor, CONTROLLED_TEXT_INSERTION_COMMAND, data);
+      }
       $maybeMoveSelectionPastTrailingAcceptanceBoundary(data);
     } else {
       inputState.unprocessedBeforeInputData = data;
@@ -1559,6 +1643,7 @@ function onCompositionEnd(
 
 function onKeyDown(event: KeyboardEvent, editor: LexicalEditor): void {
   const inputState = editor._inputState;
+  inputState.imeReplacedText = null;
   inputState.lastKeyDownTimeStamp = event.timeStamp;
   inputState.lastKeyCode = event.key;
   if (event.key !== 'Backspace') {

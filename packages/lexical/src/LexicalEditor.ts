@@ -261,10 +261,18 @@ export interface CollapsedSelectionFormat {
 }
 
 /** @internal */
+export interface IMEReplacedText {
+  format: number;
+  style: string;
+  text: string;
+}
+
+/** @internal */
 export interface InputState {
   compositionPhase: 'idle' | 'composing' | 'ending-firefox' | 'ending-safari';
   compositionEndData: string;
   hadOrphanedCompositionEvents: boolean;
+  imeReplacedText: IMEReplacedText | null;
 
   lastKeyDownTimeStamp: number;
   lastKeyCode: string | null;
@@ -295,6 +303,7 @@ export function createInputState(): InputState {
     compositionPhase: 'idle',
     hadOrphanedCompositionEvents: false,
     handledSelectionCommandTimeoutId: null,
+    imeReplacedText: null,
     isInsertLineBreak: false,
     isInsertTextAfterHandledSelectionCommand: false,
     isSelectionChangeFromDOMUpdate: false,
