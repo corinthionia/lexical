@@ -24,6 +24,7 @@ import {
 import {
   $getNearestBlockElementAncestorOrThrow,
   $handleIndentAndOutdent,
+  $isAtStartOfNode,
   eventFiles,
   objectKlassEquals,
 } from '@lexical/utils';
@@ -46,6 +47,7 @@ import {
   $getDocument,
   $getEditor,
   $getNearestNodeFromDOMNode,
+  $getNearestRootOrShadowRoot,
   $getRoot,
   $getSelection,
   $getSiblingCaret,
@@ -657,6 +659,28 @@ function $isSelectionCollapsedAtFrontOfIndentedBlock(
   return (
     element.getIndent() > 0 &&
     (element.is(anchorNode) || anchorNode.is(element.getFirstDescendant()))
+  );
+}
+
+/**
+ * True when the caret sits at the very start of the document.
+ *
+ * WebKit fires no `beforeinput` for Backspace wherever nothing precedes the
+ * caret in the editing host, leaving the iOS pass-through nothing to delegate
+ * to. This workaround only needs the top-level document-start case: a first
+ * list item is handled by `@lexical/list`, and a leading table's first cell is
+ * already a no-op. Hence the root-or-shadow-root check, without which
+ * `$isAtStartOfNode` would match those positions too.
+ *
+ * Keep in sync with `@lexical/plain-text`.
+ */
+function $isSelectionCollapsedAtStartOfDocument(
+  selection: RangeSelection,
+): boolean {
+  return (
+    selection.isCollapsed() &&
+    $isRootNode($getNearestRootOrShadowRoot(selection.anchor.getNode())) &&
+    $isAtStartOfNode(selection.anchor, $getRoot())
   );
 }
 
@@ -1729,7 +1753,14 @@ export function registerRichText(
           // on keydown; the beforeinput deleteContentBackward handler still runs
           // and performs the deletion, so editing behavior is unchanged.
           // See https://github.com/facebook/lexical/issues/5841
-          if (IS_IOS && CAN_USE_BEFORE_INPUT) {
+          //
+          // Except for the top-level document-start case handled here, where
+          // WebKit fires no beforeinput.
+          if (
+            IS_IOS &&
+            CAN_USE_BEFORE_INPUT &&
+            !$isSelectionCollapsedAtStartOfDocument(selection)
+          ) {
             return false;
           }
         } else if (!$isNodeSelection(selection)) {

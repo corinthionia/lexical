@@ -22,15 +22,28 @@
  *     correct character, leaving editing behavior unchanged.
  *  3. The indented-block outdent path is NOT affected (it must still
  *     preventDefault to avoid the browser moving the caret to the prev line).
+ *  4. The pass-through does NOT apply at the very start of the document,
+ *     where WebKit fires no beforeinput to delegate to.
  */
 
+import type {AnyLexicalExtension} from '@lexical/extension';
+
+import {$createCodeNode, CodeExtension} from '@lexical/code';
 import {buildEditorFromExtensions} from '@lexical/extension';
-import {RichTextExtension} from '@lexical/rich-text';
+import {PlainTextExtension} from '@lexical/plain-text';
+import {
+  $createHeadingNode,
+  $createQuoteNode,
+  RichTextExtension,
+} from '@lexical/rich-text';
+import {$createTableNodeWithDimensions, TableExtension} from '@lexical/table';
 import {
   $createParagraphNode,
   $createTextNode,
   $getRoot,
   $getSelection,
+  $isElementNode,
+  $isParagraphNode,
   $isRangeSelection,
   $isTextNode,
   isDOMTextNode,
@@ -104,14 +117,22 @@ function editorWithTextNode(
   text: string,
   cursorOffset: null | number,
 ): LexicalEditorWithDispose {
+  return editorWithState(() => {
+    const node = $createTextNode(text);
+    $getRoot().append($createParagraphNode().append(node));
+    if (cursorOffset !== null) {
+      node.select(cursorOffset, cursorOffset);
+    }
+  });
+}
+
+/** Builds an editor rooted in a real contenteditable from `$initialEditorState`. */
+function editorWithState(
+  $initialEditorState: () => void,
+  extensions: AnyLexicalExtension[] = [RichTextExtension],
+): LexicalEditorWithDispose {
   return buildEditorFromExtensions({
-    $initialEditorState: () => {
-      const node = $createTextNode(text);
-      $getRoot().append($createParagraphNode().append(node));
-      if (cursorOffset !== null) {
-        node.select(cursorOffset, cursorOffset);
-      }
-    },
+    $initialEditorState,
     afterRegistration: editor => {
       const container = document.createElement('div');
       container.setAttribute('data-lexical-editor', 'true');
@@ -123,7 +144,7 @@ function editorWithTextNode(
         document.body.removeChild(container);
       };
     },
-    dependencies: [RichTextExtension],
+    dependencies: extensions,
     name: '[test]',
   });
 }
@@ -210,11 +231,11 @@ describe('iOS keyboard suggestion-bar fix — KEY_BACKSPACE_COMMAND pass-through
     using editor = editorWithTextNode('hello', 0);
 
     const keyEvent = createKeyboardEvent('Backspace');
-    // On iOS the command passes through (false), deletion deferred to beforeinput.
+    // Carve-out applies, but there is nothing before the caret to delete.
     const handled = editor.dispatchCommand(KEY_BACKSPACE_COMMAND, keyEvent);
-    expect(handled).toBe(false);
+    expect(handled).toBe(true);
+    expect(keyEvent.defaultPrevented).toBe(true);
 
-    // No beforeinput fired — text must remain unchanged.
     expect(editor.read('force-commit', () => $getRoot().getTextContent())).toBe(
       'hello',
     );
@@ -274,5 +295,236 @@ describe('iOS keyboard suggestion-bar fix — KEY_BACKSPACE_COMMAND pass-through
     }
 
     expect(editor.read(() => $getRoot().getTextContent())).toBe('');
+  });
+});
+
+describe('iOS Backspace at the start of the first block', () => {
+  test('an empty first-block quote collapses to a paragraph', () => {
+    using editor = editorWithState(() => {
+      const quote = $createQuoteNode();
+      $getRoot().append(quote);
+      quote.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      expect($isParagraphNode($getRoot().getFirstChild())).toBe(true);
+    });
+  });
+
+  test('a non-empty first-block quote collapses and keeps its text', () => {
+    using editor = editorWithState(() => {
+      const text = $createTextNode('quoted');
+      $getRoot().append($createQuoteNode().append(text));
+      text.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      expect($isParagraphNode($getRoot().getFirstChild())).toBe(true);
+      expect($getRoot().getTextContent()).toBe('quoted');
+    });
+  });
+
+  // Unlike quote, HeadingNode.collapseAtStart only converts when empty.
+
+  test('an empty first-block heading collapses to a paragraph', () => {
+    using editor = editorWithState(() => {
+      const heading = $createHeadingNode('h1');
+      $getRoot().append(heading);
+      heading.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      expect($isParagraphNode($getRoot().getFirstChild())).toBe(true);
+    });
+  });
+
+  test('a non-empty first-block heading is handled but does not collapse', () => {
+    using editor = editorWithState(() => {
+      const text = $createTextNode('title');
+      $getRoot().append($createHeadingNode('h1').append(text));
+      text.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      const first = $getRoot().getFirstChild();
+      invariant($isElementNode(first), 'expected an element');
+      expect(first.getType()).toBe('heading');
+      expect($getRoot().getTextContent()).toBe('title');
+    });
+  });
+
+  // A different node package on the same generic DELETE_CHARACTER_COMMAND
+  // path: @lexical/code registers no Backspace handler of its own, so without
+  // the carve-out this position does nothing on iOS.
+  test('a non-empty first-block code node collapses to a paragraph', () => {
+    using editor = editorWithState(() => {
+      const text = $createTextNode('const x = 1;');
+      $getRoot().append($createCodeNode().append(text));
+      text.select(0, 0);
+    }, [RichTextExtension, CodeExtension]);
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      expect($isParagraphNode($getRoot().getFirstChild())).toBe(true);
+      expect($getRoot().getTextContent()).toBe('const x = 1;');
+    });
+  });
+
+  test('an indented first-block quote still outdents instead of collapsing', () => {
+    // The outdent branch runs before the iOS pass-through, so both predicates
+    // are true here and source order decides.
+    using editor = editorWithState(() => {
+      const quote = $createQuoteNode().append($createTextNode('quoted'));
+      quote.setIndent(1);
+      $getRoot().append(quote);
+      quote.selectStart();
+    });
+
+    expect(
+      editor.dispatchCommand(
+        KEY_BACKSPACE_COMMAND,
+        createKeyboardEvent('Backspace'),
+      ),
+    ).toBe(true);
+    editor.read('force-commit', () => {
+      const first = $getRoot().getFirstChild();
+      invariant($isElementNode(first), 'expected an element');
+      expect(first.getType()).toBe('quote');
+      expect(first.getIndent()).toBe(0);
+    });
+  });
+
+  // Below: beforeinput does fire at these positions, so handling the keydown
+  // too would delete twice.
+
+  test('the start of a later block passes through', () => {
+    using editor = editorWithState(() => {
+      const text = $createTextNode('tail');
+      $getRoot().append(
+        $createQuoteNode().append($createTextNode('quoted')),
+        $createParagraphNode().append(text),
+      );
+      text.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('a non-collapsed selection anchored at the first block start passes through', () => {
+    using editor = editorWithState(() => {
+      const text = $createTextNode('quoted');
+      $getRoot().append($createQuoteNode().append(text));
+      text.select(0, 3);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('a later child of the first block passes through', () => {
+    using editor = editorWithState(() => {
+      const second = $createTextNode('second');
+      $getRoot().append(
+        $createQuoteNode().append(
+          $createParagraphNode().append($createTextNode('first')),
+          $createParagraphNode().append(second),
+        ),
+      );
+      second.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('the first cell of a leading table passes through', () => {
+    // $isAtStartOfNode alone matches here (it does not stop at shadow roots);
+    // the guard's root-or-shadow-root check is what keeps the carve-out off.
+    using editor = editorWithState(() => {
+      const table = $createTableNodeWithDimensions(2, 2, false);
+      $getRoot().append(
+        table,
+        $createParagraphNode().append($createTextNode('after')),
+      );
+      table.getFirstDescendant()?.selectStart();
+    }, [RichTextExtension, TableExtension]);
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('the start of a shadow-root block mid-document passes through', () => {
+    using editor = editorWithState(() => {
+      const inner = $createTextNode('inner');
+      $getRoot().append(
+        $createParagraphNode().append($createTextNode('first')),
+        $createQuoteNode({shadowRoot: true}).append(
+          $createParagraphNode().append(inner),
+        ),
+      );
+      inner.select(0, 0);
+    });
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+});
+
+describe('@lexical/plain-text carries the same carve-out', () => {
+  // plain-text registers no nodes of its own, so ParagraphNode's is the only
+  // collapseAtStart that can run: a blank first paragraph before another block.
+
+  test('a blank first paragraph before another block is removed', () => {
+    using editor = editorWithState(() => {
+      const blank = $createParagraphNode();
+      $getRoot().append(
+        blank,
+        $createParagraphNode().append($createTextNode('tail')),
+      );
+      blank.select(0, 0);
+    }, [PlainTextExtension]);
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    editor.read('force-commit', () => {
+      expect($getRoot().getChildrenSize()).toBe(1);
+      expect($getRoot().getTextContent()).toBe('tail');
+    });
+  });
+
+  test('the start of a later paragraph passes through', () => {
+    using editor = editorWithState(() => {
+      const tail = $createTextNode('tail');
+      $getRoot().append(
+        $createParagraphNode().append($createTextNode('first')),
+        $createParagraphNode().append(tail),
+      );
+      tail.select(0, 0);
+    }, [PlainTextExtension]);
+
+    const event = createKeyboardEvent('Backspace');
+    expect(editor.dispatchCommand(KEY_BACKSPACE_COMMAND, event)).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
   });
 });
