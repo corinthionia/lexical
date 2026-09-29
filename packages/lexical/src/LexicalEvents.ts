@@ -951,11 +951,29 @@ function $handleBeforeInput(event: InputEvent): boolean {
         // to the Lexical selection and delete the matched text. If applyDOMRange cannot
         // resolve the range (returns a collapsed selection), fall through to the default
         // Lexical deletion path.
+        // Only within one block and with no decorator in the range: WebKit's range
+        // skips contenteditable=false nodes, so anything wider goes through
+        // DELETE_CHARACTER_COMMAND from the untouched caret, as on other platforms.
         if (IS_IOS && targetRange !== null && !targetRange.collapsed) {
-          selection.applyDOMRange(targetRange);
-          if (!selection.isCollapsed()) {
+          const rangeSelection = selection.clone();
+          rangeSelection.applyDOMRange(targetRange);
+          const anchorBlock = $findMatchingParent(
+            rangeSelection.anchor.getNode(),
+            $isBlockElementNode,
+          );
+          const focusBlock = $findMatchingParent(
+            rangeSelection.focus.getNode(),
+            $isBlockElementNode,
+          );
+          if (
+            !rangeSelection.isCollapsed() &&
+            anchorBlock !== null &&
+            anchorBlock === focusBlock &&
+            !rangeSelection.getNodes().some($isDecoratorNode)
+          ) {
             event.preventDefault();
-            selection.removeText();
+            $setSelection(rangeSelection);
+            rangeSelection.removeText();
             return true;
           }
         }
